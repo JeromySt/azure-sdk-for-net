@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+using System;
+using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Tasks;
 using Azure.Core;
@@ -9,23 +11,23 @@ using Azure.Core.Pipeline;
 namespace Azure.Identity
 {
     /// <summary>
-    /// Provides a <see cref="TokenCredential"/> implementation which chains the <see cref="EnvironmentCredential"/> and <see cref="ManagedIdentityCredential"/> implementations to be tried in order
-    /// until one of the getToken methods returns a non-default <see cref="AccessToken"/>.
+    /// Provides an easy wrapper around <see cref="ClientAssertionCredential"/> for use with Azure Federated Identity when trying to acquire a <see cref="TokenCredential"/>.
     /// </summary>
     /// <remarks>
-    /// This credential is designed for applications deployed to Azure <see cref="DefaultAzureCredential"/> is
-    /// better suited to local development). It authenticates service principals and managed identities..
+    /// This credential is designed for applications deployed to Azure. <see cref="DefaultAzureCredential"/> which need or desire to authenticate across tenants using
+    /// a federated application.
     /// </remarks>
     internal class AzureFederatedIdentityCredential : TokenCredential
     {
         private static string s_oidcAudience = "api://AzureADTokenExchange/.default";
         private static TokenRequestContext s_msiFederatedTokenRequestContext = new TokenRequestContext(new[] { s_oidcAudience });
 
+        private readonly AzureFederatedIdentityCredentialOptions _options;
         private readonly ManagedIdentityCredential _managedIdentityCredential;
-        private readonly ClientAssertionCredential _clientAssertionCredential;
+        private readonly ConcurrentDictionary<string, Lazy<ClientAssertionCredential>> _clientAssertionCredentials = new();
 
         /// <summary>
-        /// Initializes an instance of the <see cref="AzureApplicationCredential"/>.
+        /// Initializes an instance of the <see cref="AzureFederatedIdentityCredential"/>.
         /// </summary>
         public AzureFederatedIdentityCredential() : this(new AzureFederatedIdentityCredentialOptions(), null, null)
         { }
@@ -39,16 +41,8 @@ namespace Azure.Identity
 
         internal AzureFederatedIdentityCredential(AzureFederatedIdentityCredentialOptions options, EnvironmentCredential environmentCredential = null, ManagedIdentityCredential managedIdentityCredential = null)
         {
-            // first acquire the managed identity credential.
             _managedIdentityCredential = new ManagedIdentityCredential(options.ManagedIdentityId._userAssignedId);
-            // second new up the ClientAssertionCredential which can be used to get the token from the managed identity.
-            _clientAssertionCredential = new ClientAssertionCredential(
-                options.FederatedApplicationTenantId,
-                options.FederatedApplicationId.ToString(),
-                async ct => (await _managedIdentityCredential.GetTokenAsync(s_msiFederatedTokenRequestContext, ct).ConfigureAwait(false)).Token,
-                new ClientAssertionCredentialOptions()
-                );
-            );
+            _options = options;
         }
 
         /// <summary>
@@ -76,8 +70,25 @@ namespace Azure.Identity
             => await GetTokenImplAsync(true, requestContext, cancellationToken).ConfigureAwait(false);
 
         private async ValueTask<AccessToken> GetTokenImplAsync(bool async, TokenRequestContext requestContext, CancellationToken cancellationToken)
-        => async ?
-            await _clientAssertionCredential.GetTokenAsync(requestContext, cancellationToken).ConfigureAwait(false)
-            : _clientAssertionCredential.GetToken(requestContext, cancellationToken);
+        {
+            // Get or create a client assertion credential for the federated application in the given tenant
+            ClientAssertionCredential
+                _clientAssertionCredential =
+                    _clientAssertionCredentials.AddOrUpdate(
+                        requestContext.TenantId,
+                        // use lazy to avoid the expensive cost if of ClientAssertionCredential creation if thread contention is high
+                        new Lazy<ClientAssertionCredential>(
+                            () => new ClientAssertionCredential(
+                                    requestContext.TenantId,
+                                    _options.FederatedApplicationId.ToString(),
+                                    async ct => (await _managedIdentityCredential.GetTokenAsync(s_msiFederatedTokenRequestContext, ct).ConfigureAwait(false)).Token)
+                        ),
+                        (_, existing) => existing
+                    ).Value;
+
+            return async?
+                await _clientAssertionCredential.GetTokenAsync(requestContext, cancellationToken).ConfigureAwait(false)
+                : _clientAssertionCredential.GetToken(requestContext, cancellationToken);
+        }
     }
 }
